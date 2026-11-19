@@ -1,5 +1,7 @@
 # Happy Hour
-A simple docker container that pulls local business hours from OpenStreetMap and exposes rest endpoints to Home Assistant
+A simple docker container that pulls local business hours from OpenStreetMap and exposes rest endpoints to Home Assistant. OpenStreetMap is the primary source but is missing information for many businesses. DuckDuckGo's map backend (which sources data from Yelp and Apple
+Maps) is used as a fallback source.
+
 ## Docker Compose
 ```yaml
 services:
@@ -15,6 +17,7 @@ services:
       - DEFAULT_LAT=47.039556
       - DEFAULT_LON=-63.270816
       - COVERAGE_LABEL=area name spoken in answers
+      - DDG_FALLBACK=1
       - REFRESH_SECONDS=86400
     ports:
       - 8090:8090
