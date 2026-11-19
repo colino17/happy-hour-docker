@@ -303,6 +303,9 @@ def search(q, city=None, limit=5, origin=None):
     for p in places:
         hay = f"{p['name']} {p['city'] or ''} {p['street'] or ''}".lower()
         score = fuzz.WRatio(qn, p["name"].lower())
+        # Written variants of the same name ("Feeds'n Needs") score low raw;
+        # the normalized form (defined with the DDG fallback below) fixes it.
+        score = max(score, fuzz.WRatio(_norm_str(q), _norm_str(p["name"])))
         if qn in hay:
             score = max(score, 92)
         if city:
@@ -395,6 +398,22 @@ def _ddg_place(res):
             "score": 90}
 
 
+def _norm_str(s):
+    """Normalize a business name for comparison, unifying the written forms
+    of the same name: "Feeds and Needs", "Feeds'n Needs" and "Feeds & Needs"
+    all normalize identically, as do "Scott's" / "Scotts"."""
+    s = (s or "").lower().replace("&", " and ")
+    s = re.sub(r"['’]n\b", " and ", s)   # 'n / ’n -> and
+    s = re.sub(r"['’]s\b", "", s)        # possessive 's -> gone
+    s = re.sub(r"['’]", "", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+
+def _norm_tokens(s):
+    return {t for t in _norm_str(s).split() if t not in ("and", "the")}
+
+
 def _ddg_relevant(q, title):
     qn, tn = q.strip().lower(), title.strip().lower()
     if not tn:
@@ -402,6 +421,9 @@ def _ddg_relevant(q, title):
     if qn in tn or tn in qn:
         return True
     if fuzz.WRatio(qn, tn) >= 62:
+        return True
+    nqt, ntt = _norm_tokens(q), _norm_tokens(title)
+    if nqt and ntt and (nqt <= ntt or len(nqt & ntt) * 2 >= len(nqt)):
         return True
     qtoks = {t for t in re.split(r"[^a-z0-9]+", qn) if len(t) > 2}
     ttoks = {t for t in re.split(r"[^a-z0-9]+", tn) if len(t) > 2}
@@ -505,17 +527,32 @@ def ddg_search(q, city=None, origin=None, limit=5):
             return list(hit[1])
     failed = False
     try:
+        # DDG's index keys some chains under one written form only, so try
+        # the "and" / "'n" / "&" spellings of the query until one hits.
+        variants = [q]
+        for pat, repl in ((r"\s+and\s+", "'n "), (r"\s*&\s*", " and "),
+                          (r"['’]n\b", " and")):
+            v = re.sub(pat, repl, q, flags=re.I)
+            if v != q and v not in variants:
+                variants.append(v)
         if origin is not None:
             # Widen the search until something turns up: a voice query often
             # names a business in another town (30 km finds nothing, the
             # right store may be 150 km away).
             places = []
             for radius in (DDG_RADIUS_KM, 120, 300):
-                places = _ddg_query(q, city, origin, radius_km=radius)[:limit]
+                for v in variants:
+                    places = _ddg_query(v, city, origin, radius_km=radius)[:limit]
+                    if places:
+                        break
                 if places:
                     break
         else:
-            places = _ddg_query(q, city, origin)[:limit]
+            places = []
+            for v in variants:
+                places = _ddg_query(v, city, origin)[:limit]
+                if places:
+                    break
     except Exception as e:
         print(f"[ddg] fallback failed for {q!r}: {e}", flush=True)
         places = []
@@ -532,8 +569,17 @@ def ddg_search(q, city=None, origin=None, limit=5):
 
 def _strong_name(q, name):
     qn, nn = q.strip().lower(), name.strip().lower()
-    return (qn in nn or nn in qn or fuzz.WRatio(qn, nn) >= 90
-            or fuzz.token_set_ratio(qn, nn) >= 92)
+    if (qn in nn or nn in qn or fuzz.WRatio(qn, nn) >= 90
+            or fuzz.token_set_ratio(qn, nn) >= 92):
+        return True
+    # Normalized comparison: raw fuzzy scores punish written variants of
+    # the same name ("Feeds and Needs" vs "Feeds'n Needs" scores only 71),
+    # which once let an optometrist outrank the actual feed store.
+    nq, nnn = _norm_str(q), _norm_str(name)
+    if fuzz.WRatio(nq, nnn) >= 90 or fuzz.token_set_ratio(nq, nnn) >= 92:
+        return True
+    qt, nt = _norm_tokens(q), _norm_tokens(name)
+    return bool(qt) and bool(nt) and (qt <= nt or nt <= qt)
 
 
 def _ddg_needed(q, matches, origin):
