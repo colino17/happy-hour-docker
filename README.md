@@ -17,7 +17,7 @@ services:
       COVERAGE_LABEL=area name spoken in answers
       REFRESH_SECONDS=86400
     ports:
-      - "8090:8090"
+      - 8090:8090
 ```
 ## Home Assistant Rest Sensor
 ```yaml
