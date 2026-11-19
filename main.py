@@ -40,7 +40,7 @@ DEFAULT_ORIGIN = _default_origin()
 DDG_FALLBACK = os.environ.get("DDG_FALLBACK", "1").strip().lower() not in ("0", "no", "false", "off")
 DDG_RADIUS_KM = float(os.environ.get("DDG_RADIUS_KM", "30"))
 DDG_CACHE_TTL = 6 * 3600
-DDG_CACHE_NEG_TTL = 30 * 60
+DDG_CACHE_NEG_TTL = 5 * 60
 _DDG_CACHE = {}
 _DDG_GEOCODE = {}
 _DDG_LOCK = threading.Lock()
@@ -324,9 +324,22 @@ def search(q, city=None, limit=5, origin=None):
     scored.sort(key=lambda x: -x[0])
     return [p for _, p in scored[:limit]]
 
+# ---------------------------------------------------------------------------
+# DuckDuckGo Maps fallback.
+#
+# OSM is the primary source. When OSM has no hours for a place, /answer can
+# ask DuckDuckGo's map backend (the same undocumented local.js endpoint the
+# old duckduckgo_search maps() used; data comes from Yelp feeds / Apple
+# Maps). Hours arrive as a per-weekday dict and are normalized to OSM
+# opening_hours syntax, so the rest of the pipeline doesn't care which
+# source a place came from. Unofficial endpoint: any failure returns no
+# results and the OSM-only answer stands. Disable with DDG_FALLBACK=0.
+# ---------------------------------------------------------------------------
+
 _DDG_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 _OSM_DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 _PROVINCES = {"NB", "NS", "PE", "NL", "QC", "ON", "MB", "SK", "AB", "BC", "YT", "NT", "NU"}
+
 
 def _ddg_hours_to_osm(hours):
     if not isinstance(hours, dict):
@@ -361,6 +374,7 @@ def _ddg_hours_to_osm(hours):
         i = j + 1
     return "; ".join(out)
 
+
 def _ddg_place(res):
     hours = _ddg_hours_to_osm(res.get("hours"))
     if not hours:
@@ -380,6 +394,7 @@ def _ddg_place(res):
             "osm": None, "source": "duckduckgo", "ddg_source": res.get("url"),
             "score": 90}
 
+
 def _ddg_relevant(q, title):
     qn, tn = q.strip().lower(), title.strip().lower()
     if not tn:
@@ -392,9 +407,10 @@ def _ddg_relevant(q, title):
     ttoks = {t for t in re.split(r"[^a-z0-9]+", tn) if len(t) > 2}
     return bool(qtoks & ttoks) and fuzz.token_set_ratio(qn, tn) >= 55
 
-def _ddg_bbox(city, origin):
+
+def _ddg_bbox(city, origin, radius_km=None):
     if origin is not None:
-        dlat = DDG_RADIUS_KM * 0.008983
+        dlat = (radius_km or DDG_RADIUS_KM) * 0.008983
         dlon = dlat / max(0.2, cos(radians(origin[0])))
         return (origin[0] + dlat, origin[1] - dlon, origin[0] - dlat, origin[1] + dlon)
     place = city or COVERAGE
@@ -417,9 +433,10 @@ def _ddg_bbox(city, origin):
         _DDG_GEOCODE[place] = bbox
     return bbox
 
-def _ddg_query(q, city, origin):
+
+def _ddg_query(q, city, origin, radius_km=None):
     import primp
-    bbox = _ddg_bbox(city, origin)
+    bbox = _ddg_bbox(city, origin, radius_km)
     if not bbox:
         return []
     lat_t, lon_l, lat_b, lon_r = bbox
@@ -436,15 +453,22 @@ def _ddg_query(q, city, origin):
             except Exception:
                 client = primp.Client(headers=headers, verify=verify, timeout=12)
             r = client.get("https://duckduckgo.com/", params={"q": q})
-            m = re.search(r"vqd=([\d-]+)", r.text) or re.search(r'"vqd":"([\d-]+)"', r.text)
-            if not m:
-                return []
-            params = {"q": q, "vqd": m.group(1), "tg": "maps_places", "rt": "D",
+            vqd = None
+            for pat in (r'vqd="([\d-]+)"', r"vqd='([\d-]+)'", r'"vqd":"([\d-]+)"', r"vqd=([\d-]+)"):
+                m = re.search(pat, r.text)
+                if m:
+                    vqd = m.group(1)
+                    break
+            if not vqd:
+                raise RuntimeError(f"vqd not found (HTTP {r.status_code}, {len(r.text)} bytes returned)")
+            params = {"q": q, "vqd": vqd, "tg": "maps_places", "rt": "D",
                       "mkexp": "b", "wiki_info": "1", "is_requery": "1",
                       "bbox_tl": f"{lat_t},{lon_l}", "bbox_br": f"{lat_b},{lon_r}",
                       "strict_bbox": "1"}
             r = client.get("https://duckduckgo.com/local.js", params=params)
             data = json.loads(r.text)
+            if not data.get("results"):
+                print(f"[ddg] local.js returned no results for {q!r} (HTTP {r.status_code})", flush=True)
             out, seen = [], set()
             for res in data.get("results", []):
                 if not _ddg_relevant(q, res.get("name", "")):
@@ -468,6 +492,7 @@ def _ddg_query(q, city, origin):
             time.sleep(1)
     raise last_err
 
+
 def ddg_search(q, city=None, origin=None, limit=5):
     if not DDG_FALLBACK:
         return []
@@ -478,21 +503,38 @@ def ddg_search(q, city=None, origin=None, limit=5):
         hit = _DDG_CACHE.get(key)
         if hit and now - hit[0] < (DDG_CACHE_TTL if hit[1] else DDG_CACHE_NEG_TTL):
             return list(hit[1])
+    failed = False
     try:
-        places = _ddg_query(q, city, origin)[:limit]
+        if origin is not None:
+            # Widen the search until something turns up: a voice query often
+            # names a business in another town (30 km finds nothing, the
+            # right store may be 150 km away).
+            places = []
+            for radius in (DDG_RADIUS_KM, 120, 300):
+                places = _ddg_query(q, city, origin, radius_km=radius)[:limit]
+                if places:
+                    break
+        else:
+            places = _ddg_query(q, city, origin)[:limit]
     except Exception as e:
         print(f"[ddg] fallback failed for {q!r}: {e}", flush=True)
         places = []
-    with _DDG_LOCK:
-        _DDG_CACHE[key] = (now, places)
+        failed = True
+    if not failed:
+        # Only cache completed queries. Caching a transient failure would
+        # suppress the fallback for the whole negative TTL.
+        with _DDG_LOCK:
+            _DDG_CACHE[key] = (now, places)
     if places:
         print(f"[ddg] fallback supplied {len(places)} place(s) for {q!r}", flush=True)
     return list(places)
+
 
 def _strong_name(q, name):
     qn, nn = q.strip().lower(), name.strip().lower()
     return (qn in nn or nn in qn or fuzz.WRatio(qn, nn) >= 90
             or fuzz.token_set_ratio(qn, nn) >= 92)
+
 
 def _ddg_needed(q, matches, origin):
     if not DDG_FALLBACK:
@@ -507,6 +549,7 @@ def _ddg_needed(q, matches, origin):
             return True
     return False
 
+
 def _ddg_better(q, osm_matches, fb, origin):
     if not osm_matches:
         return True
@@ -517,6 +560,7 @@ def _ddg_better(q, osm_matches, fb, origin):
         return (bool(fd) and min(fd) <= DDG_RADIUS_KM
                 and any(_strong_name(q, p["name"]) for p in fb))
     return False
+
 
 def answer(q, city=None, at=None, origin=None):
     when = now_local(at)
@@ -531,7 +575,13 @@ def answer(q, city=None, at=None, origin=None):
                 "speech": f"I couldn't find any business called {q} with hours listed in {COVERAGE}."}
     if origin is not None:
         best = max(m["score"] for m in matches)
-        eligible = [m for m in matches if m["score"] >= best - 7]
+        qn = q.strip().lower()
+        # Score band, plus any name that contains the query whole: "Kent"
+        # substring-matches "Kent Building Supplies" (score 92) but loses
+        # the band to an unrelated business named exactly "Kent" (100)
+        # 91 km away. Containment is a strong signal; let distance decide.
+        eligible = [m for m in matches
+                    if m["score"] >= best - 7 or qn in m["name"].lower()]
         chosen = eligible[:1]
         return {"found": True, "speech": describe(chosen[0], when), "source": source,
                 "when": when.isoformat(), "origin": list(origin),
