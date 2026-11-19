@@ -2,12 +2,13 @@
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 from math import asin, cos, radians, sin, sqrt
 import osmium
@@ -35,6 +36,14 @@ def _default_origin():
     return (lat_f, lon_f)
 
 DEFAULT_ORIGIN = _default_origin()
+
+DDG_FALLBACK = os.environ.get("DDG_FALLBACK", "1").strip().lower() not in ("0", "no", "false", "off")
+DDG_RADIUS_KM = float(os.environ.get("DDG_RADIUS_KM", "30"))
+DDG_CACHE_TTL = 6 * 3600
+DDG_CACHE_NEG_TTL = 30 * 60
+_DDG_CACHE = {}
+_DDG_GEOCODE = {}
+_DDG_LOCK = threading.Lock()
 
 _GEOFABRIK_CA = "https://download.geofabrik.de/north-america/canada"
 KNOWN_LOCATIONS = {
@@ -315,9 +324,208 @@ def search(q, city=None, limit=5, origin=None):
     scored.sort(key=lambda x: -x[0])
     return [p for _, p in scored[:limit]]
 
+_DDG_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_OSM_DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+_PROVINCES = {"NB", "NS", "PE", "NL", "QC", "ON", "MB", "SK", "AB", "BC", "YT", "NT", "NU"}
+
+def _ddg_hours_to_osm(hours):
+    if not isinstance(hours, dict):
+        return None
+    spans = []
+    for day in _DDG_DAYS:
+        raw = hours.get(day)
+        if not raw or not isinstance(raw, str):
+            spans.append(None)
+            continue
+        parts, ok = [], True
+        for chunk in raw.split(","):
+            chunk = chunk.strip().replace("\u2013", "-").replace("\u2014", "-")
+            m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?-(\d{1,2}):(\d{2})(?::\d{2})?$", chunk)
+            if not m:
+                ok = False
+                break
+            parts.append(f"{int(m.group(1)):02d}:{m.group(2)}-{int(m.group(3)):02d}:{m.group(4)}")
+        spans.append(",".join(parts) if ok and parts else None)
+    if all(s is None for s in spans):
+        return None
+    out, i = [], 0
+    while i < 7:
+        if spans[i] is None:
+            i += 1
+            continue
+        j = i
+        while j + 1 < 7 and spans[j + 1] == spans[i]:
+            j += 1
+        label = _OSM_DAYS[i] if i == j else f"{_OSM_DAYS[i]}-{_OSM_DAYS[j]}"
+        out.append(f"{label} {spans[i]}")
+        i = j + 1
+    return "; ".join(out)
+
+def _ddg_place(res):
+    hours = _ddg_hours_to_osm(res.get("hours"))
+    if not hours:
+        return None
+    parts = [p.strip() for p in (res.get("address") or "").split(",")]
+    street = parts[0] if parts and parts[0] else None
+    city = None
+    if len(parts) > 1:
+        toks = [t for t in parts[1].split()
+                if t not in _PROVINCES and not re.match(r"^[A-Z]\d[A-Z]\s?\d[A-Z]\d$", t)]
+        city = " ".join(toks) or None
+    coords = res.get("coordinates") or {}
+    return {"name": res["name"], "opening_hours": hours, "city": city,
+            "street": street, "postcode": None,
+            "phone": res.get("phone") or None, "website": res.get("website") or None,
+            "lat": coords.get("latitude"), "lon": coords.get("longitude"),
+            "osm": None, "source": "duckduckgo", "ddg_source": res.get("url"),
+            "score": 90}
+
+def _ddg_relevant(q, title):
+    qn, tn = q.strip().lower(), title.strip().lower()
+    if not tn:
+        return False
+    if qn in tn or tn in qn:
+        return True
+    if fuzz.WRatio(qn, tn) >= 62:
+        return True
+    qtoks = {t for t in re.split(r"[^a-z0-9]+", qn) if len(t) > 2}
+    ttoks = {t for t in re.split(r"[^a-z0-9]+", tn) if len(t) > 2}
+    return bool(qtoks & ttoks) and fuzz.token_set_ratio(qn, tn) >= 55
+
+def _ddg_bbox(city, origin):
+    if origin is not None:
+        dlat = DDG_RADIUS_KM * 0.008983
+        dlon = dlat / max(0.2, cos(radians(origin[0])))
+        return (origin[0] + dlat, origin[1] - dlon, origin[0] - dlat, origin[1] + dlon)
+    place = city or COVERAGE
+    with _DDG_LOCK:
+        if place in _DDG_GEOCODE:
+            return _DDG_GEOCODE[place]
+    bbox = None
+    try:
+        url = "https://nominatim.openstreetmap.org/search?" + \
+              urlencode({"q": place, "format": "jsonv2", "limit": "1"})
+        req = urllib.request.Request(url, headers={"User-Agent": "happy-hour/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        if data and data[0].get("boundingbox"):
+            bb = [float(x) for x in data[0]["boundingbox"]]
+            bbox = (bb[1], bb[2], bb[0], bb[3])
+    except Exception as e:
+        print(f"[ddg] geocode failed for {place!r}: {e}", flush=True)
+    with _DDG_LOCK:
+        _DDG_GEOCODE[place] = bbox
+    return bbox
+
+def _ddg_query(q, city, origin):
+    import primp
+    bbox = _ddg_bbox(city, origin)
+    if not bbox:
+        return []
+    lat_t, lon_l, lat_b, lon_r = bbox
+    verify = os.environ.get("DDG_TLS_VERIFY", "1").strip().lower() not in ("0", "no", "false")
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+               "Referer": "https://duckduckgo.com/"}
+    last_err = None
+    for _attempt in range(2):
+        try:
+            try:
+                client = primp.Client(headers=headers, verify=verify, timeout=12,
+                                      impersonate=os.environ.get("DDG_IMPERSONATE", "chrome_146"))
+            except Exception:
+                client = primp.Client(headers=headers, verify=verify, timeout=12)
+            r = client.get("https://duckduckgo.com/", params={"q": q})
+            m = re.search(r"vqd=([\d-]+)", r.text) or re.search(r'"vqd":"([\d-]+)"', r.text)
+            if not m:
+                return []
+            params = {"q": q, "vqd": m.group(1), "tg": "maps_places", "rt": "D",
+                      "mkexp": "b", "wiki_info": "1", "is_requery": "1",
+                      "bbox_tl": f"{lat_t},{lon_l}", "bbox_br": f"{lat_b},{lon_r}",
+                      "strict_bbox": "1"}
+            r = client.get("https://duckduckgo.com/local.js", params=params)
+            data = json.loads(r.text)
+            out, seen = [], set()
+            for res in data.get("results", []):
+                if not _ddg_relevant(q, res.get("name", "")):
+                    continue
+                p = _ddg_place(res)
+                if p is None:
+                    continue
+                k = (p["name"].lower(), (p["street"] or "").lower())
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(p)
+            if origin is not None:
+                for p in out:
+                    d = distance_km(origin, p)
+                    p["distance_km"] = round(d, 3) if d is not None else None
+                out.sort(key=lambda p: (p["distance_km"] is None, p["distance_km"] or 0))
+            return out
+        except Exception as e:
+            last_err = e
+            time.sleep(1)
+    raise last_err
+
+def ddg_search(q, city=None, origin=None, limit=5):
+    if not DDG_FALLBACK:
+        return []
+    key = (q.strip().lower(), (city or "").lower(),
+           tuple(round(c, 2) for c in origin) if origin else None)
+    now = time.time()
+    with _DDG_LOCK:
+        hit = _DDG_CACHE.get(key)
+        if hit and now - hit[0] < (DDG_CACHE_TTL if hit[1] else DDG_CACHE_NEG_TTL):
+            return list(hit[1])
+    try:
+        places = _ddg_query(q, city, origin)[:limit]
+    except Exception as e:
+        print(f"[ddg] fallback failed for {q!r}: {e}", flush=True)
+        places = []
+    with _DDG_LOCK:
+        _DDG_CACHE[key] = (now, places)
+    if places:
+        print(f"[ddg] fallback supplied {len(places)} place(s) for {q!r}", flush=True)
+    return list(places)
+
+def _strong_name(q, name):
+    qn, nn = q.strip().lower(), name.strip().lower()
+    return (qn in nn or nn in qn or fuzz.WRatio(qn, nn) >= 90
+            or fuzz.token_set_ratio(qn, nn) >= 92)
+
+def _ddg_needed(q, matches, origin):
+    if not DDG_FALLBACK:
+        return False
+    if not matches:
+        return True
+    if not any(_strong_name(q, m["name"]) for m in matches):
+        return True
+    if origin is not None:
+        dists = [m["distance_km"] for m in matches if m.get("distance_km") is not None]
+        if dists and min(dists) > DDG_RADIUS_KM:
+            return True
+    return False
+
+def _ddg_better(q, osm_matches, fb, origin):
+    if not osm_matches:
+        return True
+    if not any(_strong_name(q, m["name"]) for m in osm_matches):
+        return any(_strong_name(q, p["name"]) for p in fb)
+    if origin is not None:
+        fd = [p["distance_km"] for p in fb if p.get("distance_km") is not None]
+        return (bool(fd) and min(fd) <= DDG_RADIUS_KM
+                and any(_strong_name(q, p["name"]) for p in fb))
+    return False
+
 def answer(q, city=None, at=None, origin=None):
     when = now_local(at)
     matches = search(q, city=city, limit=25 if origin is not None else 5, origin=origin)
+    source = "osm"
+    if _ddg_needed(q, matches, origin):
+        fb = ddg_search(q, city=city, origin=origin)
+        if fb and _ddg_better(q, matches, fb, origin):
+            matches, source = fb, "duckduckgo"
     if not matches:
         return {"found": False,
                 "speech": f"I couldn't find any business called {q} with hours listed in {COVERAGE}."}
@@ -325,7 +533,7 @@ def answer(q, city=None, at=None, origin=None):
         best = max(m["score"] for m in matches)
         eligible = [m for m in matches if m["score"] >= best - 7]
         chosen = eligible[:1]
-        return {"found": True, "speech": describe(chosen[0], when),
+        return {"found": True, "speech": describe(chosen[0], when), "source": source,
                 "when": when.isoformat(), "origin": list(origin),
                 "candidates": len(matches),
                 "matches": [{**chosen[0], **api_eval(chosen[0], when)}]}
@@ -340,7 +548,7 @@ def answer(q, city=None, at=None, origin=None):
                  " ".join(parts)
     else:
         speech = describe(chosen[0], when)
-    return {"found": True, "speech": speech, "when": when.isoformat(),
+    return {"found": True, "speech": speech, "when": when.isoformat(), "source": source,
             "matches": [{**m, **api_eval(m, when)} for m in chosen]}
 
 class Handler(BaseHTTPRequestHandler):
@@ -373,7 +581,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         qs = {k: v[0] for k, v in parse_qs(u.query).items()}
         if u.path == "/health":
-            self.send_json({"ok": True, "default_origin": DEFAULT_ORIGIN, **INDEX_META})
+            self.send_json({"ok": True, "default_origin": DEFAULT_ORIGIN,
+                            "ddg_fallback": DDG_FALLBACK, **INDEX_META})
         elif u.path in ("/search", "/open", "/answer"):
             q = qs.get("q", "").strip()
             if not q:
