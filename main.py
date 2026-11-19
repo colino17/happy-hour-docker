@@ -282,17 +282,23 @@ def describe(place, when):
     elif ev["is_open"]:
         spans = " and ".join(f"{fmt_time(a)} to {fmt_time(b)}" for a, b in ev["today"]) if ev["today"] else None
         closes = fmt_time(datetime.fromisoformat(ev["next_change"])) if ev["next_change"] else None
-        text = (f"Yes, {label} is open today, {spans}." if spans else f"Yes, {label} is open now.") + \
-               (f" It closes at {closes}." if closes else "")
+        if spans and closes:
+            text = f"{label} is open today, {spans}. It closes at {closes}."
+        elif spans:
+            # No known closing time (e.g. open 24 hours): short form.
+            text = f"{label} is open today."
+        else:
+            text = f"{label} is currently open." + \
+                   (f" It closes at {closes}." if closes else "")
     elif ev["today"]:
         spans = " and ".join(f"{fmt_time(a)} to {fmt_time(b)}" for a, b in ev["today"])
         opens = ev["today"][0][0]
         if when.replace(tzinfo=None) < opens:
-            text = f"No, {label} is closed right now. It opens today at {fmt_time(opens)} and closes at {fmt_time(ev['today'][0][1])}."
+            text = f"{label} is currently closed. It opens today at {fmt_time(opens)} and closes at {fmt_time(ev['today'][0][1])}."
         else:
-            text = f"No, {label} was open today, {spans}, but it's closed now."
+            text = f"{label} was open today, {spans}, but it's closed now."
     else:
-        text = f"No, {label} is closed today."
+        text = f"{label} is closed today."
     return text + _dist_phrase(place)
 
 def search(q, city=None, limit=5, origin=None):
