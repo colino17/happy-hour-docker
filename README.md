@@ -13,7 +13,7 @@ services:
       - TZ=America/Moncton
       - LOCATIONS=nova-scotia,new-brunswick,ontario
       - DEFAULT_LAT=47.039556
-      - DEFAULT_LONG=-63.270816
+      - DEFAULT_LON=-63.270816
       - COVERAGE_LABEL=area name spoken in answers
       - REFRESH_SECONDS=86400
     ports:
