@@ -15,8 +15,6 @@ services:
       DEFAULT_LAT=47.039556
       DEFAULT_LONG=-63.270816
       COVERAGE_LABEL=area name spoken in answers
-      DEFAULT_LAT: ${DEFAULT_LAT:-}
-      DEFAULT_LON: ${DEFAULT_LON:-}
       REFRESH_SECONDS=86400
     ports:
       - "8090:8090"
