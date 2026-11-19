@@ -137,7 +137,7 @@ class HoursHandler(osmium.SimpleHandler):
 
 def download_extract(url, dest):
     tmp = dest + ".tmp"
-    req = urllib.request.Request(url, headers={"User-Agent": "nb-hours/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "happy-hour/1.0"})
     with urllib.request.urlopen(req, timeout=600) as r, open(tmp, "wb") as f:
         while chunk := r.read(1 << 20):
             f.write(chunk)
@@ -166,7 +166,7 @@ def build_combined():
             p["region"] = s["slug"]
         per_source[s["slug"]] = len(places)
         all_places.extend(places)
-        print(f"[nb-hours] {s['slug']}: {len(places)} places", flush=True)
+        print(f"[happy-hour] {s['slug']}: {len(places)} places", flush=True)
     return _dedupe(all_places), per_source
 
 def refresh():
@@ -176,27 +176,27 @@ def refresh():
         os.replace(legacy, SOURCES[0]["path"])
     for s in SOURCES:
         if not os.path.exists(s["path"]):
-            print(f"[nb-hours] downloading {s['slug']} extract...", flush=True)
+            print(f"[happy-hour] downloading {s['slug']} extract...", flush=True)
             download_extract(s["url"], s["path"])
-    print(f"[nb-hours] parsing {len(SOURCES)} extract(s) for {COVERAGE}...", flush=True)
+    print(f"[happy-hour] parsing {len(SOURCES)} extract(s) for {COVERAGE}...", flush=True)
     places, per_source = build_combined()
     with INDEX_LOCK:
         INDEX.clear()
         INDEX.extend(places)
         INDEX_META.update(count=len(places), per_location=per_source,
                           built_at=datetime.now(LOCAL_TZ).isoformat())
-    print(f"[nb-hours] indexed {len(places)} places with opening_hours", flush=True)
+    print(f"[happy-hour] indexed {len(places)} places with opening_hours", flush=True)
 
 def refresh_loop():
     while True:
         time.sleep(REFRESH_SECONDS)
         try:
-            print("[nb-hours] daily refresh: downloading fresh extract(s)...", flush=True)
+            print("[happy-hour] daily refresh: downloading fresh extract(s)...", flush=True)
             for s in SOURCES:
                 download_extract(s["url"], s["path"])
             refresh()
         except Exception as e:  # keep serving the old index
-            print(f"[nb-hours] refresh failed, keeping old index: {e}", flush=True)
+            print(f"[happy-hour] refresh failed, keeping old index: {e}", flush=True)
 
 def fmt_time(dt):
     """21:00 -> '9 PM', 07:30 -> '7:30 AM' (spoken form)."""
@@ -398,5 +398,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     refresh()
     threading.Thread(target=refresh_loop, daemon=True).start()
-    print(f"[nb-hours] listening on :{PORT} (tz {TZ_NAME}, coverage {COVERAGE})", flush=True)
+    print(f"[happy-hour] listening on :{PORT} (tz {TZ_NAME}, coverage {COVERAGE})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
