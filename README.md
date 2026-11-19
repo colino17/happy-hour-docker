@@ -21,3 +21,53 @@ services:
     ports:
       - "8090:8090"
 ```
+## Home Assistant Rest Sensor
+```yaml
+rest_command:
+  happy_hour:
+    url: "http://192.168.1.10:8090/answer?q={{ q | urlencode }}{% if c %}&city={{ c | urlencode }}{% endif %}"
+    method: GET
+    timeout: 10
+```
+## Home Assistant Voice Commands
+```yaml
+- alias: Voice Business Hours
+  id: voice_business_hours
+  triggers:
+    # LOCAL BUSINESSES
+    - trigger: conversation
+      id: voice_business_hours_local
+      command:
+        - "(is|when|what time) [does] [the] {business} (open|close) [today|now]"
+    # BUSINESSES IN SPECIFIC CITIES
+    - trigger: conversation
+      id: voice_business_hours_city
+      command:
+        - "(is|when|what time) [does] [the] {business} in {city} (open|close) [today]"
+  actions:
+    - choose:
+        # LOCAL BUSINESSES
+        - conditions:
+            - condition: trigger
+              id: voice_business_hours_local
+          sequence:
+            - action: rest_command.happy_hour
+              data:
+                q: "{{ trigger.slots.business }}"
+                c: ""
+              response_variable: hours
+            - set_conversation_response: "{{ hours.content.speech if hours.status == 200 else 'Sorry, I could not reach the business hours service.' }}"
+        # BUSINESSES IN SPECIFIC CITIES
+        - conditions:
+            - condition: trigger
+              id: voice_business_hours_city
+          sequence:
+            - action: rest_command.happy_hour
+              data:
+                q: "{{ trigger.slots.business }}"
+                c: "{{ trigger.slots.city }}"
+              response_variable: hours
+            - set_conversation_response: "{{ hours.content.speech if hours.status == 200 else 'Sorry, I could not reach the business hours service.' }}"
+```
+## Disclosure
+Muse and Claude were heavily used to assist the development of the subject code. Gemini was also used as a secondary code auditing tool.
