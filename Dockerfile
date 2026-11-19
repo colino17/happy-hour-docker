@@ -6,10 +6,9 @@ ENV TZ="America/Moncton"
 ENV PORT="8090"
 
 # SETUP APP
-WORKDIR /app
-COPY app/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app/main.py .
+COPY main.py .
 
 # VOLUMES
 VOLUME ["/data"]
